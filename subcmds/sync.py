@@ -582,7 +582,7 @@ later is required to fix a server side protocol bug.
     if not opt.local_only:
       to_fetch = []
       now = time.time()
-      if _ONE_DAY_S <= (now - rp.LastFetch):
+      if rp.Exists and _ONE_DAY_S <= (now - rp.LastFetch):
         to_fetch.append(rp)
       to_fetch.extend(all_projects)
       to_fetch.sort(key=self._fetch_times.Get, reverse=True)
@@ -647,6 +647,8 @@ def _PostRepoUpgrade(manifest, quiet=False):
       project.PostRepoUpgrade()
 
 def _PostRepoFetch(rp, no_repo_verify=False, verbose=False):
+  if not rp.Exists:
+    return
   if rp.HasChanges:
     print('info: A new version of repo is available', file=sys.stderr)
     print(file=sys.stderr)
