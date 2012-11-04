@@ -1,0 +1,20 @@
+Package: git-repo
+Priority: optional
+Section: vcs
+Maintainer: 
+Architecture: all
+Version: 
+Depends: git (>= 1:@GIT_MINVER@), python
+Description: Git multi-repo manager
+ Git is popular version control system designed to handle very large
+ projects with speed and efficiency; it is used for many high profile
+ open source projects, most notably the Linux kernel.
+ .
+ Git falls in the category of distributed source code management tools.
+ Every Git working directory is a full-fledged repository with full
+ revision tracking capabilities, not dependent on network access or a
+ central server.
+ .
+ This package provides a script and some hooks to manage multiple repositories
+ with one command: repo.
+Homepage: https://code.google.com/p/git-repo/
