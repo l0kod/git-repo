@@ -22,15 +22,19 @@ import optparse
 import os
 import sys
 import time
-try:
-  import urllib2
-except ImportError:
-  # For python3
+
+from pyversion import is_python3
+if is_python3():
   import urllib.request
 else:
-  # For python2
+  import urllib2
   urllib = imp.new_module('urllib')
   urllib.request = urllib2
+
+try:
+  import kerberos
+except ImportError:
+  kerberos = None
 
 from trace import SetTrace
 from git_command import git, GitCommand
@@ -47,8 +51,14 @@ from error import NoSuchProjectError
 from error import RepoChangedException
 from manifest_xml import XmlManifest
 from pager import RunPager
+from wrapper import WrapperPath, Wrapper
 
 from subcmds import all_commands
+
+if not is_python3():
+  # pylint:disable=W0622
+  input = raw_input
+  # pylint:enable=W0622
 
 global_options = optparse.OptionParser(
                  usage="repo [-p|--paginate|--no-pager] COMMAND [ARGS]"
@@ -119,8 +129,15 @@ class _Repo(object):
             file=sys.stderr)
       return 1
 
-    copts, cargs = cmd.OptionParser.parse_args(argv)
-    copts = cmd.ReadEnvironmentOptions(copts)
+    try:
+      copts, cargs = cmd.OptionParser.parse_args(argv)
+      copts = cmd.ReadEnvironmentOptions(copts)
+    except NoManifestException as e:
+      print('error: in `%s`: %s' % (' '.join([name] + argv), str(e)),
+        file=sys.stderr)
+      print('error: manifest missing or unreadable -- please run init',
+            file=sys.stderr)
+      return 1
 
     if not gopts.no_pager and not isinstance(cmd, InteractiveCommand):
       config = cmd.manifest.globalConfig
@@ -136,15 +153,13 @@ class _Repo(object):
     start = time.time()
     try:
       result = cmd.Execute(copts, cargs)
-    except DownloadError as e:
-      print('error: %s' % str(e), file=sys.stderr)
-      result = 1
-    except ManifestInvalidRevisionError as e:
-      print('error: %s' % str(e), file=sys.stderr)
-      result = 1
-    except NoManifestException as e:
-      print('error: manifest required for this command -- please run init',
-            file=sys.stderr)
+    except (DownloadError, ManifestInvalidRevisionError,
+        NoManifestException) as e:
+      print('error: in `%s`: %s' % (' '.join([name] + argv), str(e)),
+        file=sys.stderr)
+      if isinstance(e, NoManifestException):
+        print('error: manifest missing or unreadable -- please run init',
+              file=sys.stderr)
       result = 1
     except NoSuchProjectError as e:
       if e.name:
@@ -165,21 +180,10 @@ class _Repo(object):
 
     return result
 
+
 def _MyRepoPath():
   return os.path.dirname(__file__)
 
-def _MyWrapperPath():
-  return os.path.join(os.path.dirname(__file__), 'repo')
-
-_wrapper_module = None
-def WrapperModule():
-  global _wrapper_module
-  if not _wrapper_module:
-    _wrapper_module = imp.load_source('wrapper', _MyWrapperPath())
-  return _wrapper_module
-
-def _CurrentWrapperVersion():
-  return WrapperModule().VERSION
 
 def _CheckWrapperVersion(ver, repo_path):
   if not repo_path:
@@ -189,7 +193,7 @@ def _CheckWrapperVersion(ver, repo_path):
     print('no --wrapper-version argument', file=sys.stderr)
     sys.exit(1)
 
-  exp = _CurrentWrapperVersion()
+  exp = Wrapper().VERSION
   ver = tuple(map(int, ver.split('.')))
   if len(ver) == 1:
     ver = (0, ver[0])
@@ -201,7 +205,7 @@ def _CheckWrapperVersion(ver, repo_path):
 !!! You must upgrade before you can continue:   !!!
 
     cp %s %s
-""" % (exp_str, _MyWrapperPath(), repo_path), file=sys.stderr)
+""" % (exp_str, WrapperPath(), repo_path), file=sys.stderr)
     sys.exit(1)
 
   if exp > ver:
@@ -210,7 +214,7 @@ def _CheckWrapperVersion(ver, repo_path):
 ... You should upgrade soon:
 
     cp %s %s
-""" % (exp_str, _MyWrapperPath(), repo_path), file=sys.stderr)
+""" % (exp_str, WrapperPath(), repo_path), file=sys.stderr)
 
 def _CheckRepoDir(repo_dir):
   if not repo_dir:
@@ -286,7 +290,7 @@ def _AddPasswordFromUserInput(handler, msg, req):
   if user is None:
     print(msg)
     try:
-      user = raw_input('User: ')
+      user = input('User: ')
       password = getpass.getpass()
     except KeyboardInterrupt:
       return
@@ -338,6 +342,86 @@ class _DigestAuthHandler(urllib.request.HTTPDigestAuthHandler):
         self.retried = 0
       raise
 
+class _KerberosAuthHandler(urllib.request.BaseHandler):
+  def __init__(self):
+    self.retried = 0
+    self.context = None
+    self.handler_order = urllib.request.BaseHandler.handler_order - 50
+
+  def http_error_401(self, req, fp, code, msg, headers):
+    host = req.get_host()
+    retry = self.http_error_auth_reqed('www-authenticate', host, req, headers)
+    return retry
+
+  def http_error_auth_reqed(self, auth_header, host, req, headers):
+    try:
+      spn = "HTTP@%s" % host
+      authdata = self._negotiate_get_authdata(auth_header, headers)
+
+      if self.retried > 3:
+        raise urllib.request.HTTPError(req.get_full_url(), 401,
+          "Negotiate auth failed", headers, None)
+      else:
+        self.retried += 1
+
+      neghdr = self._negotiate_get_svctk(spn, authdata)
+      if neghdr is None:
+        return None
+
+      req.add_unredirected_header('Authorization', neghdr)
+      response = self.parent.open(req)
+
+      srvauth = self._negotiate_get_authdata(auth_header, response.info())
+      if self._validate_response(srvauth):
+        return response
+    except kerberos.GSSError:
+      return None
+    except:
+      self.reset_retry_count()
+      raise
+    finally:
+      self._clean_context()
+
+  def reset_retry_count(self):
+    self.retried = 0
+
+  def _negotiate_get_authdata(self, auth_header, headers):
+    authhdr = headers.get(auth_header, None)
+    if authhdr is not None:
+      for mech_tuple in authhdr.split(","):
+        mech, __, authdata = mech_tuple.strip().partition(" ")
+        if mech.lower() == "negotiate":
+          return authdata.strip()
+    return None
+
+  def _negotiate_get_svctk(self, spn, authdata):
+    if authdata is None:
+      return None
+
+    result, self.context = kerberos.authGSSClientInit(spn)
+    if result < kerberos.AUTH_GSS_COMPLETE:
+      return None
+
+    result = kerberos.authGSSClientStep(self.context, authdata)
+    if result < kerberos.AUTH_GSS_CONTINUE:
+      return None
+
+    response = kerberos.authGSSClientResponse(self.context)
+    return "Negotiate %s" % response
+
+  def _validate_response(self, authdata):
+    if authdata is None:
+      return None
+    result = kerberos.authGSSClientStep(self.context, authdata)
+    if result == kerberos.AUTH_GSS_COMPLETE:
+      return True
+    return None
+
+  def _clean_context(self):
+    if self.context is not None:
+      kerberos.authGSSClientClean(self.context)
+      self.context = None
+
 def init_http():
   handlers = [_UserAgentHandler()]
 
@@ -354,6 +438,8 @@ def init_http():
     pass
   handlers.append(_BasicAuthHandler(mgr))
   handlers.append(_DigestAuthHandler(mgr))
+  if kerberos:
+    handlers.append(_KerberosAuthHandler())
 
   if 'http_proxy' in os.environ:
     url = os.environ['http_proxy']

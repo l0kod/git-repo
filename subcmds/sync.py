@@ -14,18 +14,29 @@
 # limitations under the License.
 
 from __future__ import print_function
+import json
 import netrc
 from optparse import SUPPRESS_HELP
 import os
-import pickle
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
-import urlparse
-import xmlrpclib
+
+from pyversion import is_python3
+if is_python3():
+  import urllib.parse
+  import xmlrpc.client
+else:
+  import imp
+  import urlparse
+  import xmlrpclib
+  urllib = imp.new_module('urllib')
+  urllib.parse = urlparse
+  xmlrpc = imp.new_module('xmlrpc')
+  xmlrpc.client = xmlrpclib
 
 try:
   import threading as _threading
@@ -47,13 +58,13 @@ except ImportError:
 
 from git_command import GIT, git_require
 from git_refs import R_HEADS, HEAD
-from main import WrapperModule
 from project import Project
 from project import RemoteSpec
 from command import Command, MirrorSafeCommand
 from error import RepoChangedException, GitError, ManifestParseError
 from project import SyncBuffer
 from progress import Progress
+from wrapper import Wrapper
 
 _ONE_DAY_S = 24 * 60 * 60
 
@@ -208,8 +219,24 @@ later is required to fix a server side protocol bug.
                  dest='repo_upgraded', action='store_true',
                  help=SUPPRESS_HELP)
 
-  def _FetchHelper(self, opt, project, lock, fetched, pm, sem, err_event):
+  def _FetchProjectList(self, opt, projects, *args, **kwargs):
     """Main function of the fetch threads when jobs are > 1.
+
+    Delegates most of the work to _FetchHelper.
+
+    Args:
+      opt: Program options returned from optparse.  See _Options().
+      projects: Projects to fetch.
+      *args, **kwargs: Remaining arguments to pass to _FetchHelper. See the
+          _FetchHelper docstring for details.
+    """
+    for project in projects:
+      success = self._FetchHelper(opt, project, *args, **kwargs)
+      if not success and not opt.force_broken:
+        break
+
+  def _FetchHelper(self, opt, project, lock, fetched, pm, sem, err_event):
+    """Fetch git objects for a single project.
 
     Args:
       opt: Program options returned from optparse.  See _Options().
@@ -224,9 +251,15 @@ later is required to fix a server side protocol bug.
           can be started up.
       err_event: We'll set this event in the case of an error (after printing
           out info about the error).
+
+    Returns:
+      Whether the fetch was successful.
     """
     # We'll set to true once we've locked the lock.
     did_lock = False
+
+    if not opt.quiet:
+      print('Fetching project %s' % project.name)
 
     # Encapsulate everything in a try/except/finally so that:
     # - We always set err_event in the case of an exception.
@@ -239,7 +272,7 @@ later is required to fix a server side protocol bug.
           quiet=opt.quiet,
           current_branch_only=opt.current_branch_only,
           clone_bundle=not opt.no_clone_bundle,
-          no_tags=opt.no_tags)
+          no_tags=opt.no_tags, archive=self.manifest.IsArchive)
         self._fetch_times.Set(project, time.time() - start)
 
         # Lock around all the rest of the code, since printing, updating a set
@@ -267,65 +300,65 @@ later is required to fix a server side protocol bug.
         lock.release()
       sem.release()
 
+    return success
+
   def _Fetch(self, projects, opt):
     fetched = set()
+    lock = _threading.Lock()
     pm = Progress('Fetching projects', len(projects))
 
-    if self.jobs == 1:
-      for project in projects:
-        pm.update()
-        if project.Sync_NetworkHalf(
-            quiet=opt.quiet,
-            current_branch_only=opt.current_branch_only,
-            clone_bundle=not opt.no_clone_bundle,
-            no_tags=opt.no_tags):
-          fetched.add(project.gitdir)
-        else:
-          print('error: Cannot fetch %s' % project.name, file=sys.stderr)
-          if opt.force_broken:
-            print('warn: --force-broken, continuing to sync', file=sys.stderr)
-          else:
-            sys.exit(1)
-    else:
-      threads = set()
-      lock = _threading.Lock()
-      sem = _threading.Semaphore(self.jobs)
-      err_event = _threading.Event()
-      for project in projects:
-        # Check for any errors before starting any new threads.
-        # ...we'll let existing threads finish, though.
-        if err_event.isSet():
-          break
+    objdir_project_map = dict()
+    for project in projects:
+      objdir_project_map.setdefault(project.objdir, []).append(project)
 
-        sem.acquire()
-        t = _threading.Thread(target = self._FetchHelper,
-                              args = (opt,
-                                      project,
-                                      lock,
-                                      fetched,
-                                      pm,
-                                      sem,
-                                      err_event))
+    threads = set()
+    sem = _threading.Semaphore(self.jobs)
+    err_event = _threading.Event()
+    for project_list in objdir_project_map.values():
+      # Check for any errors before running any more tasks.
+      # ...we'll let existing threads finish, though.
+      if err_event.isSet() and not opt.force_broken:
+        break
+
+      sem.acquire()
+      kwargs = dict(opt=opt,
+                    projects=project_list,
+                    lock=lock,
+                    fetched=fetched,
+                    pm=pm,
+                    sem=sem,
+                    err_event=err_event)
+      if self.jobs > 1:
+        t = _threading.Thread(target = self._FetchProjectList,
+                              kwargs = kwargs)
         # Ensure that Ctrl-C will not freeze the repo process.
         t.daemon = True
         threads.add(t)
         t.start()
+      else:
+        self._FetchProjectList(**kwargs)
 
-      for t in threads:
-        t.join()
+    for t in threads:
+      t.join()
 
-      # If we saw an error, exit with code 1 so that other scripts can check.
-      if err_event.isSet():
-        print('\nerror: Exited sync due to fetch errors', file=sys.stderr)
-        sys.exit(1)
+    # If we saw an error, exit with code 1 so that other scripts can check.
+    if err_event.isSet():
+      print('\nerror: Exited sync due to fetch errors', file=sys.stderr)
+      sys.exit(1)
 
     pm.end()
     self._fetch_times.Save()
 
-    self._GCProjects(projects)
+    if not self.manifest.IsArchive:
+      self._GCProjects(projects)
+
     return fetched
 
   def _GCProjects(self, projects):
+    gitdirs = {}
+    for project in projects:
+      gitdirs[project.gitdir] = project.bare_git
+
     has_dash_c = git_require((1, 7, 2))
     if multiprocessing and has_dash_c:
       cpu_count = multiprocessing.cpu_count()
@@ -334,8 +367,8 @@ later is required to fix a server side protocol bug.
     jobs = min(self.jobs, cpu_count)
 
     if jobs < 2:
-      for project in projects:
-        project.bare_git.gc('--auto')
+      for bare_git in gitdirs.values():
+        bare_git.gc('--auto')
       return
 
     config = {'pack.threads': cpu_count / jobs if cpu_count > jobs else 1}
@@ -344,10 +377,10 @@ later is required to fix a server side protocol bug.
     sem = _threading.Semaphore(jobs)
     err_event = _threading.Event()
 
-    def GC(project):
+    def GC(bare_git):
       try:
         try:
-          project.bare_git.gc('--auto', config=config)
+          bare_git.gc('--auto', config=config)
         except GitError:
           err_event.set()
         except:
@@ -356,11 +389,11 @@ later is required to fix a server side protocol bug.
       finally:
         sem.release()
 
-    for project in projects:
+    for bare_git in gitdirs.values():
       if err_event.isSet():
         break
       sem.acquire()
-      t = _threading.Thread(target=GC, args=(project,))
+      t = _threading.Thread(target=GC, args=(bare_git,))
       t.daemon = True
       threads.add(t)
       t.start()
@@ -371,6 +404,13 @@ later is required to fix a server side protocol bug.
     if err_event.isSet():
       print('\nerror: Exited sync due to gc errors', file=sys.stderr)
       sys.exit(1)
+
+  def _ReloadManifest(self, manifest_name=None):
+    if manifest_name:
+      # Override calls _Unload already
+      self.manifest.Override(manifest_name)
+    else:
+      self.manifest._Unload()
 
   def UpdateProjectList(self):
     new_project_paths = []
@@ -393,12 +433,13 @@ later is required to fix a server side protocol bug.
         if path not in new_project_paths:
           # If the path has already been deleted, we don't need to do it
           if os.path.exists(self.manifest.topdir + '/' + path):
+            gitdir = os.path.join(self.manifest.topdir, path, '.git')
             project = Project(
                            manifest = self.manifest,
                            name = path,
                            remote = RemoteSpec('origin'),
-                           gitdir = os.path.join(self.manifest.topdir,
-                                                 path, '.git'),
+                           gitdir = gitdir,
+                           objdir = gitdir,
                            worktree = os.path.join(self.manifest.topdir, path),
                            relpath = path,
                            revisionExpr = 'HEAD',
@@ -464,6 +505,8 @@ later is required to fix a server side protocol bug.
     if opt.manifest_name:
       self.manifest.Override(opt.manifest_name)
 
+    manifest_name = opt.manifest_name
+
     if opt.smart_sync or opt.smart_tag:
       if not self.manifest.manifest_server:
         print('error: cannot smart sync: no manifest server defined in '
@@ -471,6 +514,8 @@ later is required to fix a server side protocol bug.
         sys.exit(1)
 
       manifest_server = self.manifest.manifest_server
+      if not opt.quiet:
+        print('Using manifest server %s' % manifest_server)
 
       if not '@' in manifest_server:
         username = None
@@ -486,7 +531,7 @@ later is required to fix a server side protocol bug.
                   file=sys.stderr)
           else:
             try:
-              parse_result = urlparse.urlparse(manifest_server)
+              parse_result = urllib.parse.urlparse(manifest_server)
               if parse_result.hostname:
                 username, _account, password = \
                   info.authenticators(parse_result.hostname)
@@ -504,7 +549,7 @@ later is required to fix a server side protocol bug.
                                                     1)
 
       try:
-        server = xmlrpclib.Server(manifest_server)
+        server = xmlrpc.client.Server(manifest_server)
         if opt.smart_sync:
           p = self.manifest.manifestProject
           b = p.GetBranch(p.CurrentBranch)
@@ -513,8 +558,10 @@ later is required to fix a server side protocol bug.
             branch = branch[len(R_HEADS):]
 
           env = os.environ.copy()
-          if (env.has_key('TARGET_PRODUCT') and
-              env.has_key('TARGET_BUILD_VARIANT')):
+          if 'SYNC_TARGET' in env:
+            target = env['SYNC_TARGET']
+            [success, manifest_str] = server.GetApprovedManifest(branch, target)
+          elif 'TARGET_PRODUCT' in env and 'TARGET_BUILD_VARIANT' in env:
             target = '%s-%s' % (env['TARGET_PRODUCT'],
                                 env['TARGET_BUILD_VARIANT'])
             [success, manifest_str] = server.GetApprovedManifest(branch, target)
@@ -538,15 +585,16 @@ later is required to fix a server side protocol bug.
             print('error: cannot write manifest to %s' % manifest_path,
                   file=sys.stderr)
             sys.exit(1)
-          self.manifest.Override(manifest_name)
+          self._ReloadManifest(manifest_name)
         else:
-          print('error: %s' % manifest_str, file=sys.stderr)
+          print('error: manifest server RPC call failed: %s' %
+                manifest_str, file=sys.stderr)
           sys.exit(1)
-      except (socket.error, IOError, xmlrpclib.Fault) as e:
+      except (socket.error, IOError, xmlrpc.client.Fault) as e:
         print('error: cannot connect to manifest server %s:\n%s'
               % (self.manifest.manifest_server, e), file=sys.stderr)
         sys.exit(1)
-      except xmlrpclib.ProtocolError as e:
+      except xmlrpc.client.ProtocolError as e:
         print('error: cannot connect to manifest server %s:\n%d %s'
               % (self.manifest.manifest_server, e.errcode, e.errmsg),
               file=sys.stderr)
@@ -571,7 +619,7 @@ later is required to fix a server side protocol bug.
       mp.Sync_LocalHalf(syncbuf)
       if not syncbuf.Finish():
         sys.exit(1)
-      self.manifest._Unload()
+      self._ReloadManifest(manifest_name)
       if opt.jobs is None:
         self.jobs = self.manifest.default.sync_j
     all_projects = self.GetProjects(args,
@@ -596,7 +644,7 @@ later is required to fix a server side protocol bug.
       # Iteratively fetch missing and/or nested unregistered submodules
       previously_missing_set = set()
       while True:
-        self.manifest._Unload()
+        self._ReloadManifest(manifest_name)
         all_projects = self.GetProjects(args,
                                         missing_ok=True,
                                         submodules_ok=opt.fetch_submodules)
@@ -614,7 +662,7 @@ later is required to fix a server side protocol bug.
         previously_missing_set = missing_set
         fetched.update(self._Fetch(missing, opt))
 
-    if self.manifest.IsMirror:
+    if self.manifest.IsMirror or self.manifest.IsArchive:
       # bail out now, we have no working tree
       return
 
@@ -639,10 +687,10 @@ later is required to fix a server side protocol bug.
       print(self.manifest.notice)
 
 def _PostRepoUpgrade(manifest, quiet=False):
-  wrapper = WrapperModule()
+  wrapper = Wrapper()
   if wrapper.NeedSetupGnuPG():
     wrapper.SetupGnuPG(quiet)
-  for project in manifest.projects.values():
+  for project in manifest.projects:
     if project.Exists:
       project.PostRepoUpgrade()
 
@@ -717,7 +765,7 @@ class _FetchTimes(object):
   _ALPHA = 0.5
 
   def __init__(self, manifest):
-    self._path = os.path.join(manifest.repodir, '.repopickle_fetchtimes')
+    self._path = os.path.join(manifest.repodir, '.repo_fetchtimes.json')
     self._times = None
     self._seen = set()
 
@@ -737,21 +785,16 @@ class _FetchTimes(object):
     if self._times is None:
       try:
         f = open(self._path)
-      except IOError:
-        self._times = {}
-        return self._times
-      try:
         try:
-          self._times = pickle.load(f)
-        except IOError:
-          try:
-            os.remove(self._path)
-          except OSError:
-            pass
-          self._times = {}
-      finally:
-        f.close()
-    return self._times
+          self._times = json.load(f)
+        finally:
+          f.close()
+      except (IOError, ValueError):
+        try:
+          os.remove(self._path)
+        except OSError:
+          pass
+        self._times = {}
 
   def Save(self):
     if self._times is None:
@@ -765,13 +808,13 @@ class _FetchTimes(object):
       del self._times[name]
 
     try:
-      f = open(self._path, 'wb')
+      f = open(self._path, 'w')
       try:
-        pickle.dump(self._times, f)
-      except (IOError, OSError, pickle.PickleError):
-        try:
-          os.remove(self._path)
-        except OSError:
-          pass
-    finally:
-      f.close()
+        json.dump(self._times, f, indent=2)
+      finally:
+        f.close()
+    except (IOError, TypeError):
+      try:
+        os.remove(self._path)
+      except OSError:
+        pass

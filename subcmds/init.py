@@ -20,6 +20,15 @@ import re
 import shutil
 import sys
 
+from pyversion import is_python3
+if is_python3():
+  import urllib.parse
+else:
+  import imp
+  import urlparse
+  urllib = imp.new_module('urllib')
+  urllib.parse = urlparse.urlparse
+
 from color import Coloring
 from command import InteractiveCommand, MirrorSafeCommand
 from error import ManifestParseError
@@ -90,9 +99,14 @@ to update the working directory files.
     g.add_option('--depth', type='int', default=None,
                  dest='depth',
                  help='create a shallow clone with given depth; see git clone')
+    g.add_option('--archive',
+                 dest='archive', action='store_true',
+                 help='checkout an archive instead of a git repository for '
+                      'each project. See git archive.')
     g.add_option('-g', '--groups',
-                 dest='groups', default='all,-notdefault',
-                 help='restrict manifest projects to ones with a specified group',
+                 dest='groups', default='default',
+                 help='restrict manifest projects to ones with specified '
+                      'group(s) [default|all|G1,G2,G3|G4,-G5,-G6]',
                  metavar='GROUP')
     g.add_option('-p', '--platform',
                  dest='platform', default='auto',
@@ -134,7 +148,19 @@ to update the working directory files.
       if not opt.quiet:
         print('Get %s' % GitConfig.ForUser().UrlInsteadOf(opt.manifest_url),
               file=sys.stderr)
-      m._InitGitDir()
+
+      # The manifest project object doesn't keep track of the path on the
+      # server where this git is located, so let's save that here.
+      mirrored_manifest_git = None
+      if opt.reference:
+        manifest_git_path = urllib.parse(opt.manifest_url).path[1:]
+        mirrored_manifest_git = os.path.join(opt.reference, manifest_git_path)
+        if not mirrored_manifest_git.endswith(".git"):
+          mirrored_manifest_git += ".git"
+        if not os.path.exists(mirrored_manifest_git):
+          mirrored_manifest_git = os.path.join(opt.reference + '/.repo/manifests.git')
+
+      m._InitGitDir(mirror_git=mirrored_manifest_git)
 
       if opt.manifest_branch:
         m.revisionExpr = opt.manifest_branch
@@ -169,12 +195,22 @@ to update the working directory files.
 
     groups = [x for x in groups if x]
     groupstr = ','.join(groups)
-    if opt.platform == 'auto' and groupstr == 'all,-notdefault,platform-' + platform.system().lower():
+    if opt.platform == 'auto' and groupstr == 'default,platform-' + platform.system().lower():
       groupstr = None
     m.config.SetString('manifest.groups', groupstr)
 
     if opt.reference:
       m.config.SetString('repo.reference', opt.reference)
+
+    if opt.archive:
+      if is_new:
+        m.config.SetString('repo.archive', 'true')
+      else:
+        print('fatal: --archive is only supported when initializing a new '
+              'workspace.', file=sys.stderr)
+        print('Either delete the .repo folder in this workspace, or initialize '
+              'in another location.', file=sys.stderr)
+        sys.exit(1)
 
     if opt.mirror:
       if is_new:
@@ -343,6 +379,13 @@ to update the working directory files.
 
     if opt.reference:
       opt.reference = os.path.expanduser(opt.reference)
+
+    # Check this here, else manifest will be tagged "not new" and init won't be
+    # possible anymore without removing the .repo/manifests directory.
+    if opt.archive and opt.mirror:
+      print('fatal: --mirror and --archive cannot be used together.',
+            file=sys.stderr)
+      sys.exit(1)
 
     self._SyncManifest(opt)
     self._LinkManifest(opt.manifest_name)

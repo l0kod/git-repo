@@ -21,6 +21,7 @@ import tempfile
 from signal import SIGTERM
 from error import GitError
 from trace import REPO_TRACE, IsTrace, Trace
+from wrapper import Wrapper
 
 GIT = 'git'
 MIN_GIT_VERSION = (1, 5, 4)
@@ -79,20 +80,15 @@ class _GitCall(object):
   def version(self):
     p = GitCommand(None, ['--version'], capture_stdout=True)
     if p.Wait() == 0:
-      return p.stdout
+      return p.stdout.decode('utf-8')
     return None
 
   def version_tuple(self):
     global _git_version
-
     if _git_version is None:
       ver_str = git.version()
-      if ver_str.startswith('git version '):
-        _git_version = tuple(
-          map(int,
-            ver_str[len('git version '):].strip().split('-')[0].split('.')[0:3]
-          ))
-      else:
+      _git_version = Wrapper().ParseGitVersion(ver_str)
+      if _git_version is None:
         print('fatal: "%s" unsupported' % ver_str, file=sys.stderr)
         sys.exit(1)
     return _git_version

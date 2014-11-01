@@ -14,7 +14,8 @@
 # limitations under the License.
 
 from __future__ import print_function
-import cPickle
+
+import json
 import os
 import re
 import subprocess
@@ -24,14 +25,13 @@ try:
 except ImportError:
   import dummy_threading as _threading
 import time
-try:
-  import urllib2
-except ImportError:
-  # For python3
+
+from pyversion import is_python3
+if is_python3():
   import urllib.request
   import urllib.error
 else:
-  # For python2
+  import urllib2
   import imp
   urllib = imp.new_module('urllib')
   urllib.request = urllib2
@@ -40,6 +40,10 @@ else:
 from signal import SIGTERM
 from error import GitError, UploadError
 from trace import Trace
+if is_python3():
+  from http.client import HTTPException
+else:
+  from httplib import HTTPException
 
 from git_command import GitCommand
 from git_command import ssh_sock
@@ -76,7 +80,7 @@ class GitConfig(object):
     return cls(configfile = os.path.join(gitdir, 'config'),
                defaults = defaults)
 
-  def __init__(self, configfile, defaults=None, pickleFile=None):
+  def __init__(self, configfile, defaults=None, jsonFile=None):
     self.file = configfile
     self.defaults = defaults
     self._cache_dict = None
@@ -84,12 +88,11 @@ class GitConfig(object):
     self._remotes = {}
     self._branches = {}
 
-    if pickleFile is None:
-      self._pickle = os.path.join(
+    self._json = jsonFile
+    if self._json is None:
+      self._json = os.path.join(
         os.path.dirname(self.file),
-        '.repopickle_' + os.path.basename(self.file))
-    else:
-      self._pickle = pickleFile
+        '.repo_' + os.path.basename(self.file) + '.json')
 
   def Has(self, name, include_defaults = True):
     """Return true if this configuration file has the key.
@@ -213,9 +216,9 @@ class GitConfig(object):
     """Resolve any url.*.insteadof references.
     """
     for new_url in self.GetSubSections('url'):
-      old_url = self.GetString('url.%s.insteadof' % new_url)
-      if old_url is not None and url.startswith(old_url):
-        return new_url + url[len(old_url):]
+      for old_url in self.GetString('url.%s.insteadof' % new_url, True):
+        if old_url is not None and url.startswith(old_url):
+          return new_url + url[len(old_url):]
     return url
 
   @property
@@ -244,50 +247,41 @@ class GitConfig(object):
     return self._cache_dict
 
   def _Read(self):
-    d = self._ReadPickle()
+    d = self._ReadJson()
     if d is None:
       d = self._ReadGit()
-      self._SavePickle(d)
+      self._SaveJson(d)
     return d
 
-  def _ReadPickle(self):
+  def _ReadJson(self):
     try:
-      if os.path.getmtime(self._pickle) \
+      if os.path.getmtime(self._json) \
       <= os.path.getmtime(self.file):
-        os.remove(self._pickle)
+        os.remove(self._json)
         return None
     except OSError:
       return None
     try:
-      Trace(': unpickle %s', self.file)
-      fd = open(self._pickle, 'rb')
+      Trace(': parsing %s', self.file)
+      fd = open(self._json)
       try:
-        return cPickle.load(fd)
+        return json.load(fd)
       finally:
         fd.close()
-    except EOFError:
-      os.remove(self._pickle)
-      return None
-    except IOError:
-      os.remove(self._pickle)
-      return None
-    except cPickle.PickleError:
-      os.remove(self._pickle)
+    except (IOError, ValueError):
+      os.remove(self._json)
       return None
 
-  def _SavePickle(self, cache):
+  def _SaveJson(self, cache):
     try:
-      fd = open(self._pickle, 'wb')
+      fd = open(self._json, 'w')
       try:
-        cPickle.dump(cache, fd, cPickle.HIGHEST_PROTOCOL)
+        json.dump(cache, fd, indent=2)
       finally:
         fd.close()
-    except IOError:
-      if os.path.exists(self._pickle):
-        os.remove(self._pickle)
-    except cPickle.PickleError:
-      if os.path.exists(self._pickle):
-        os.remove(self._pickle)
+    except (IOError, TypeError):
+      if os.path.exists(self.json):
+        os.remove(self._json)
 
   def _ReadGit(self):
     """
@@ -300,8 +294,8 @@ class GitConfig(object):
     d = self._do('--null', '--list')
     if d is None:
       return c
-    for line in d.rstrip('\0').split('\0'):  # pylint: disable=W1401
-                                             # Backslash is not anomalous
+    for line in d.decode('utf-8').rstrip('\0').split('\0'):  # pylint: disable=W1401
+                                                             # Backslash is not anomalous
       if '\n' in line:
         key, val = line.split('\n', 1)
       else:
@@ -537,8 +531,8 @@ class Remote(object):
     self.url = self._Get('url')
     self.review = self._Get('review')
     self.projectname = self._Get('projectname')
-    self.fetch = map(RefSpec.FromString,
-                     self._Get('fetch', all_keys=True))
+    self.fetch = list(map(RefSpec.FromString,
+                      self._Get('fetch', all_keys=True)))
     self._review_url = None
 
   def _InsteadOf(self):
@@ -572,7 +566,9 @@ class Remote(object):
         return None
 
       u = self.review
-      if not u.startswith('http:') and not u.startswith('https:'):
+      if u.startswith('persistent-'):
+        u = u[len('persistent-'):]
+      if u.split(':')[0] not in ('http', 'https', 'sso'):
         u = 'http://%s' % u
       if u.endswith('/Gerrit'):
         u = u[:len(u) - len('/Gerrit')]
@@ -588,19 +584,19 @@ class Remote(object):
         host, port = os.environ['REPO_HOST_PORT_INFO'].split()
         self._review_url = self._SshReviewUrl(userEmail, host, port)
         REVIEW_CACHE[u] = self._review_url
+      elif u.startswith('sso:'):
+        self._review_url = u  # Assume it's right
+        REVIEW_CACHE[u] = self._review_url
       else:
         try:
           info_url = u + 'ssh_info'
           info = urllib.request.urlopen(info_url).read()
-          if '<' in info:
-            # Assume the server gave us some sort of HTML
-            # response back, like maybe a login page.
+          if info == 'NOT_AVAILABLE' or '<' in info:
+            # If `info` contains '<', we assume the server gave us some sort
+            # of HTML response back, like maybe a login page.
             #
-            raise UploadError('%s: Cannot parse response' % info_url)
-
-          if info == 'NOT_AVAILABLE':
-            # Assume HTTP if SSH is not enabled.
-            self._review_url = http_url + 'p/'
+            # Assume HTTP if SSH is not enabled or ssh_info doesn't look right.
+            self._review_url = http_url
           else:
             host, port = info.split()
             self._review_url = self._SshReviewUrl(userEmail, host, port)
@@ -608,6 +604,8 @@ class Remote(object):
           raise UploadError('%s: %s' % (self.review, str(e)))
         except urllib.error.URLError as e:
           raise UploadError('%s: %s' % (self.review, str(e)))
+        except HTTPException as e:
+          raise UploadError('%s: %s' % (self.review, e.__class__.__name__))
 
         REVIEW_CACHE[u] = self._review_url
     return self._review_url + self.projectname
@@ -623,8 +621,6 @@ class Remote(object):
     """
     if IsId(rev):
       return rev
-    if rev.startswith(R_TAGS):
-      return rev
 
     if not rev.startswith('refs/'):
       rev = R_HEADS + rev
@@ -632,6 +628,10 @@ class Remote(object):
     for spec in self.fetch:
       if spec.SourceMatches(rev):
         return spec.MapSource(rev)
+
+    if not rev.startswith(R_HEADS):
+      return rev
+
     raise GitError('remote %s does not have %s' % (self.name, rev))
 
   def WritesTo(self, ref):
@@ -657,7 +657,7 @@ class Remote(object):
     self._Set('url', self.url)
     self._Set('review', self.review)
     self._Set('projectname', self.projectname)
-    self._Set('fetch', map(str, self.fetch))
+    self._Set('fetch', list(map(str, self.fetch)))
 
   def _Set(self, key, value):
     key = 'remote.%s.%s' % (self.name, key)
@@ -701,7 +701,7 @@ class Branch(object):
       self._Set('merge', self.merge)
 
     else:
-      fd = open(self._config.file, 'ab')
+      fd = open(self._config.file, 'a')
       try:
         fd.write('[branch "%s"]\n' % self.name)
         if self.remote:
